@@ -1,16 +1,54 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Language, Gender, HistoryItem, AppStatus } from './types';
 import { TRANSLATIONS, LANGUAGE_NAMES } from './constants';
 import WaveVisualizer from './components/WaveVisualizer';
-import { translateText } from './services/geminiService';
+
+// --- Utilities for Audio Processing ---
+function encode(bytes: Uint8Array) {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function decode(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
 
 const App: React.FC = () => {
   // UI State
   const [sourceLang, setSourceLang] = useState<Language | 'auto'>('auto');
   const [targetLang, setTargetLang] = useState<Language>(Language.English);
   const [gender, setGender] = useState<Gender>('male');
-  const [model, setModel] = useState('gemini-3-flash-preview');
   const [status, setStatus] = useState<AppStatus>('Klar');
   const [isRecording, setIsRecording] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -21,152 +59,156 @@ const App: React.FC = () => {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [stream, setStream] = useState<MediaStream | null>(null);
 
-  // References
-  const recognitionRef = useRef<any>(null);
-  const synthesisRef = useRef<SpeechSynthesis | null>(window.speechSynthesis);
+  // References for Live API
+  const sessionRef = useRef<any>(null);
+  const inputAudioContextRef = useRef<AudioContext | null>(null);
+  const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  
   const uiStrings = TRANSLATIONS[targetLang];
 
-  // Restart recognition if language changes while recording
-  useEffect(() => {
-    if (isRecording) {
-      stopListening();
-      startListening();
-    }
-  }, [sourceLang]);
-
-  // Handle TTS Queue
-  const speak = useCallback((text: string) => {
-    if (!synthesisRef.current || !text) return;
-    
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = targetLang;
-    
-    // Attempt to pick a voice matching the gender/language
-    const voices = synthesisRef.current.getVoices();
-    const voice = voices.find(v => 
-      v.lang.startsWith(targetLang.split('-')[0]) && 
-      (gender === 'male' ? v.name.toLowerCase().includes('male') : v.name.toLowerCase().includes('female'))
-    ) || voices.find(v => v.lang.startsWith(targetLang.split('-')[0]));
-    
-    if (voice) utterance.voice = voice;
-    
-    utterance.onstart = () => setStatus('Taler...');
-    utterance.onend = () => setStatus('Lytter...');
-    
-    synthesisRef.current.speak(utterance);
-  }, [targetLang, gender]);
-
-  // Setup Speech Recognition (Full-Duplex)
-  const startListening = async () => {
-    try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ 
-        audio: { 
-          echoCancellation: true, 
-          noiseSuppression: true, 
-          autoGainControl: true 
-        } 
-      });
-      setStream(mediaStream);
-
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SpeechRecognition) {
-        alert("Your browser does not support Speech Recognition.");
-        return;
-      }
-
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      
-      // Set recognition language. If auto, default to browser language or empty string
-      recognition.lang = sourceLang === 'auto' ? '' : sourceLang;
-
-      recognition.onstart = () => {
-        setIsRecording(true);
-        setStatus('Lytter...');
-      };
-
-      recognition.onresult = async (event: any) => {
-        let interimTranscript = '';
-        let finalTranscript = '';
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
-        }
-
-        if (interimTranscript) setTranscript(interimTranscript);
-
-        if (finalTranscript) {
-          setTranscript(finalTranscript);
-          setStatus('Oversætter...');
-          
-          const translated = await translateText(finalTranscript, LANGUAGE_NAMES[targetLang], model);
-          setTranslation(translated);
-          
-          const newHistoryItem: HistoryItem = {
-            timestamp: new Date(),
-            originalText: finalTranscript,
-            translatedText: translated,
-            sourceLang: sourceLang === 'auto' ? 'Auto-detected' : LANGUAGE_NAMES[sourceLang],
-            targetLang: LANGUAGE_NAMES[targetLang]
-          };
-          setHistory(prev => [newHistoryItem, ...prev]);
-          
-          speak(translated);
-        }
-      };
-
-      recognition.onerror = (event: any) => {
-        console.error('Recognition error', event.error);
-        setStatus('Error');
-        if (event.error === 'no-speech') {
-            recognition.stop();
-            setTimeout(() => {
-                if (isRecording) recognition.start();
-            }, 100);
-        }
-      };
-
-      recognition.onend = () => {
-        if (isRecording) {
-            try {
-                recognition.start();
-            } catch (e) {
-                console.warn('Could not restart recognition automatically', e);
-            }
-        }
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-
-    } catch (err) {
-      console.error('Failed to get microphone access', err);
-      setStatus('Error');
-    }
-  };
-
-  const stopListening = () => {
+  const stopSession = useCallback(() => {
     setIsRecording(false);
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      recognitionRef.current = null;
+    if (sessionRef.current) {
+      sessionRef.current.close();
+      sessionRef.current = null;
     }
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
       setStream(null);
     }
+    if (inputAudioContextRef.current) {
+      inputAudioContextRef.current.close();
+      inputAudioContextRef.current = null;
+    }
+    // We keep output context warm or close it
     setStatus('Klar');
-    if (synthesisRef.current) synthesisRef.current.cancel();
+  }, [stream]);
+
+  const startSession = async () => {
+    try {
+      setStatus('Lytter...');
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      
+      // Initialize Audio Contexts (Must be inside user gesture for mobile)
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      inputAudioContextRef.current = inputCtx;
+      outputAudioContextRef.current = outputCtx;
+
+      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setStream(mediaStream);
+
+      const voiceName = gender === 'male' ? 'Zephyr' : 'Kore';
+      
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
+          },
+          systemInstruction: `You are a professional real-time translator. 
+          Current Source Language: ${sourceLang === 'auto' ? 'Auto-detect' : LANGUAGE_NAMES[sourceLang]}. 
+          Target Language: ${LANGUAGE_NAMES[targetLang]}.
+          Translate everything the user says immediately into the target language. 
+          Provide ONLY the translated speech. Do not engage in conversation unless asked to translate a question.`,
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+        },
+        callbacks: {
+          onopen: () => {
+            setIsRecording(true);
+            const source = inputCtx.createMediaStreamSource(mediaStream);
+            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+            
+            scriptProcessor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const l = inputData.length;
+              const int16 = new Int16Array(l);
+              for (let i = 0; i < l; i++) {
+                int16[i] = inputData[i] * 32768;
+              }
+              const pcmBase64 = encode(new Uint8Array(int16.buffer));
+              
+              sessionPromise.then((session) => {
+                if (session) {
+                  session.sendRealtimeInput({ 
+                    media: { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' } 
+                  });
+                }
+              });
+            };
+            
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(inputCtx.destination);
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            // Handle Transcriptions
+            if (message.serverContent?.inputTranscription) {
+              setTranscript(prev => message.serverContent?.inputTranscription?.text || prev);
+            }
+            if (message.serverContent?.outputTranscription) {
+              setTranslation(prev => message.serverContent?.outputTranscription?.text || prev);
+            }
+
+            // Handle Audio Output
+            const audioData = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (audioData && outputAudioContextRef.current) {
+              const ctx = outputAudioContextRef.current;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              
+              const audioBuffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
+              const source = ctx.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(ctx.destination);
+              
+              source.onended = () => sourcesRef.current.delete(source);
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += audioBuffer.duration;
+              sourcesRef.current.add(source);
+              setStatus('Taler...');
+            }
+
+            if (message.serverContent?.turnComplete) {
+              setStatus('Lytter...');
+              // Update History
+              setHistory(prev => [{
+                timestamp: new Date(),
+                originalText: transcript,
+                translatedText: translation,
+                sourceLang: sourceLang === 'auto' ? 'Auto' : LANGUAGE_NAMES[sourceLang as Language],
+                targetLang: LANGUAGE_NAMES[targetLang]
+              }, ...prev]);
+            }
+
+            if (message.serverContent?.interrupted) {
+              sourcesRef.current.forEach(s => s.stop());
+              sourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+            }
+          },
+          onclose: () => stopSession(),
+          onerror: (e) => {
+            console.error("Live API Error:", e);
+            setStatus('Error');
+            stopSession();
+          }
+        }
+      });
+
+      sessionRef.current = await sessionPromise;
+
+    } catch (err) {
+      console.error('Failed to start Live session:', err);
+      setStatus('Error');
+    }
   };
 
   const toggleRecording = () => {
-    if (isRecording) stopListening();
-    else startListening();
+    if (isRecording) stopSession();
+    else startSession();
   };
 
   return (
@@ -174,7 +216,7 @@ const App: React.FC = () => {
       {/* Top Bar */}
       <header className="glass p-4 px-6 flex items-center justify-between z-10">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center animate-pulse">
+          <div className={`w-10 h-10 rounded-full flex items-center justify-center ${isRecording ? 'bg-red-600 animate-pulse' : 'bg-blue-600'}`}>
             <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
             </svg>
@@ -193,6 +235,7 @@ const App: React.FC = () => {
               value={sourceLang}
               onChange={(e) => setSourceLang(e.target.value as Language | 'auto')}
               className="bg-slate-800 border border-slate-700 text-sm rounded-lg px-3 py-1 outline-none hover:border-blue-500 transition-colors"
+              disabled={isRecording}
             >
               <option value="auto">{uiStrings.auto}</option>
               {Object.entries(Language).map(([key, value]) => (
@@ -207,29 +250,12 @@ const App: React.FC = () => {
               value={targetLang}
               onChange={(e) => setTargetLang(e.target.value as Language)}
               className="bg-slate-800 border border-slate-700 text-sm rounded-lg px-3 py-1 outline-none hover:border-blue-500 transition-colors"
+              disabled={isRecording}
             >
               {Object.entries(Language).map(([key, value]) => (
                 <option key={value} value={value}>{key}</option>
               ))}
             </select>
-          </div>
-
-          <div className="hidden md:flex flex-col gap-1">
-            <label className="text-[10px] uppercase tracking-wider text-slate-400">{uiStrings.gender}</label>
-            <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700">
-              <button 
-                onClick={() => setGender('male')}
-                className={`px-3 py-0.5 text-xs rounded-md transition-all ${gender === 'male' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}
-              >
-                {uiStrings.male}
-              </button>
-              <button 
-                onClick={() => setGender('female')}
-                className={`px-3 py-0.5 text-xs rounded-md transition-all ${gender === 'female' ? 'bg-pink-600 text-white' : 'text-slate-400 hover:text-white'}`}
-              >
-                {uiStrings.female}
-              </button>
-            </div>
           </div>
         </div>
       </header>
@@ -250,25 +276,21 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex-1 flex flex-col md:flex-row gap-6">
-            {/* Split View - Source */}
             <div className="flex-1 glass rounded-3xl p-6 flex flex-col border border-slate-800">
               <h3 className="text-sm font-semibold text-blue-400 mb-3 flex items-center gap-2">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"></path><path d="M15.54 8.46a5 5 0 010 7.07M19.07 4.93a10 10 0 010 14.14"></path></svg>
                 {uiStrings.heardText}
               </h3>
               <div className="flex-1 overflow-y-auto text-lg leading-relaxed text-slate-300">
-                {transcript || <span className="text-slate-600 italic">Start speaking...</span>}
+                {transcript || <span className="text-slate-600 italic">Tryk på knappen for at starte...</span>}
               </div>
             </div>
 
-            {/* Split View - Translated */}
             <div className="flex-1 glass rounded-3xl p-6 flex flex-col border border-slate-800">
                <h3 className="text-sm font-semibold text-indigo-400 mb-3 flex items-center gap-2">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 5h12M9 3v2m1.048 9.5a18.022 18.022 0 01-3.827-5.802h2.779c.143 0 .285-.01.425-.03m-2.11 5.833c.451.988 1.05 1.884 1.77 2.667m4.24-5.833H16c1.105 0 2 .895 2 2v2m-6 3l1.5 3L11 21"></path></svg>
                 {uiStrings.translatedText}
               </h3>
               <div className="flex-1 overflow-y-auto text-lg leading-relaxed text-indigo-100 font-medium">
-                {translation || <span className="text-slate-600 italic">Translation will appear here...</span>}
+                {translation || <span className="text-slate-600 italic">Oversættelsen vises her...</span>}
               </div>
             </div>
           </div>
@@ -290,35 +312,29 @@ const App: React.FC = () => {
           <button 
             onClick={() => setShowHistory(true)}
             className="w-12 h-12 rounded-2xl flex items-center justify-center bg-slate-800 border border-slate-700 text-slate-400 hover:text-white transition-all"
-            title={uiStrings.history}
           >
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+          </button>
+
+          <button 
+            onClick={() => setGender(prev => prev === 'male' ? 'female' : 'male')}
+            className={`w-12 h-12 rounded-2xl flex items-center justify-center border transition-all ${gender === 'male' ? 'bg-blue-900/20 border-blue-500 text-blue-400' : 'bg-pink-900/20 border-pink-500 text-pink-400'}`}
+          >
+             {gender === 'male' ? '♂' : '♀'}
           </button>
         </div>
       </main>
 
-      {/* Footer Settings */}
-      <footer className="glass p-3 px-6 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <label className="text-xs text-slate-400">{uiStrings.model}:</label>
-          <select 
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="bg-transparent text-xs font-semibold text-slate-200 outline-none cursor-pointer hover:text-blue-400 transition-colors"
-          >
-            <option value="gemini-3-flash-preview" className="bg-slate-800">Gemini 3 Flash</option>
-            <option value="gemini-3-pro-preview" className="bg-slate-800">Gemini 3 Pro</option>
-          </select>
-        </div>
+      <footer className="glass p-3 px-6 flex items-center justify-center">
         <div className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">
-          Powered by Gemini AI Engine
+          Powered by Gemini 2.5 Live Native Audio
         </div>
       </footer>
 
-      {/* History Modal/Drawer */}
+      {/* History Modal */}
       {showHistory && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex justify-end">
-          <div className="w-full max-w-md bg-slate-900 border-l border-slate-700 h-full flex flex-col animate-slide-in">
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex justify-end" onClick={() => setShowHistory(false)}>
+          <div className="w-full max-w-md bg-slate-900 border-l border-slate-700 h-full flex flex-col animate-slide-in" onClick={e => e.stopPropagation()}>
             <div className="p-6 border-b border-slate-800 flex items-center justify-between">
               <h2 className="text-xl font-bold flex items-center gap-2">
                 <svg className="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -329,39 +345,24 @@ const App: React.FC = () => {
               </button>
             </div>
             <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {history.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-slate-600 gap-4">
-                  <svg className="w-12 h-12 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
-                  <p>No history yet. Start a conversation!</p>
-                </div>
-              ) : (
-                history.map((item, idx) => (
-                  <div key={idx} className="bg-slate-800/50 rounded-2xl p-4 border border-slate-700/50">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[10px] text-slate-500">{item.timestamp.toLocaleTimeString()}</span>
-                      <div className="flex gap-2">
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-700/40 text-slate-300 border border-slate-600">{item.sourceLang}</span>
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-900/40 text-blue-300 border border-blue-800">{item.targetLang}</span>
-                      </div>
-                    </div>
-                    <p className="text-sm text-slate-400 mb-2 italic">"{item.originalText}"</p>
-                    <p className="text-sm text-indigo-100 font-medium">{item.translatedText}</p>
+              {history.map((item, idx) => (
+                <div key={idx} className="bg-slate-800/50 rounded-2xl p-4 border border-slate-700/50">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[10px] text-slate-500">{item.timestamp.toLocaleTimeString()}</span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-900/40 text-blue-300 border border-blue-800">{item.targetLang}</span>
                   </div>
-                ))
-              )}
+                  <p className="text-sm text-slate-400 mb-1">"{item.originalText}"</p>
+                  <p className="text-sm text-indigo-100 font-medium">{item.translatedText}</p>
+                </div>
+              ))}
             </div>
           </div>
         </div>
       )}
 
       <style>{`
-        @keyframes slide-in {
-          from { transform: translateX(100%); }
-          to { transform: translateX(0); }
-        }
-        .animate-slide-in {
-          animation: slide-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-        }
+        @keyframes slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
+        .animate-slide-in { animation: slide-in 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
       `}</style>
     </div>
   );
