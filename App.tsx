@@ -71,7 +71,7 @@ const App: React.FC = () => {
   const stopSession = useCallback(() => {
     setIsRecording(false);
     if (sessionRef.current) {
-      sessionRef.current.close();
+      try { sessionRef.current.close(); } catch(e) {}
       sessionRef.current = null;
     }
     if (stream) {
@@ -79,7 +79,7 @@ const App: React.FC = () => {
       setStream(null);
     }
     if (inputAudioContextRef.current) {
-      inputAudioContextRef.current.close();
+      try { inputAudioContextRef.current.close(); } catch(e) {}
       inputAudioContextRef.current = null;
     }
     setStatus('Klar');
@@ -89,11 +89,11 @@ const App: React.FC = () => {
     try {
       setStatus('Lytter...');
       
-      // Initialize Audio Contexts (Must be inside user gesture for mobile)
+      // Initialize Audio Contexts with explicit sample rates for mobile consistency
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
-      // Explicitly resume for mobile browser compliance
+      // Mobile browsers REQUIRE resume() within a user-initiated event (like this click)
       await inputCtx.resume();
       await outputCtx.resume();
       
@@ -112,7 +112,6 @@ const App: React.FC = () => {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const voiceName = gender === 'male' ? 'Zephyr' : 'Kore';
       
-      // SYSTEM INSTRUCTION updated as per user request
       const systemInstruction = `Overvåg kontinuerligt inputtet. 
       Din opgave er at være en øjeblikkelig oversætter til ${LANGUAGE_NAMES[targetLang]}.
       Så snart du registrerer et sprog eller tale, der IKKE er ${LANGUAGE_NAMES[targetLang]}, skal du påbegynde en øjeblikkelig oversættelse til ${LANGUAGE_NAMES[targetLang]}.
@@ -139,9 +138,13 @@ const App: React.FC = () => {
           onopen: () => {
             setIsRecording(true);
             const source = inputCtx.createMediaStreamSource(mediaStream);
+            // ScriptProcessor is older but more broadly compatible on mobile than AudioWorklets in some quick implementations
             const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
+              // Only send if session is alive and context is running
+              if (inputCtx.state !== 'running') return;
+              
               const inputData = e.inputBuffer.getChannelData(0);
               const l = inputData.length;
               const int16 = new Int16Array(l);
@@ -151,7 +154,7 @@ const App: React.FC = () => {
               const pcmBase64 = encode(new Uint8Array(int16.buffer));
               
               sessionPromise.then((session) => {
-                if (session) {
+                if (session && session.sendRealtimeInput) {
                   session.sendRealtimeInput({ 
                     media: { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' } 
                   });
@@ -163,7 +166,7 @@ const App: React.FC = () => {
             scriptProcessor.connect(inputCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle Transcriptions
+            // Check for transcription
             if (message.serverContent?.inputTranscription) {
               setTranscript(message.serverContent.inputTranscription.text);
             }
@@ -171,27 +174,33 @@ const App: React.FC = () => {
               setTranslation(message.serverContent.outputTranscription.text);
             }
 
-            // Handle Audio Output
+            // Audio processing
             const audioData = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (audioData && outputAudioContextRef.current) {
               const ctx = outputAudioContextRef.current;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              
+              // Ensure context is still running (iOS can suspend it)
+              if (ctx.state === 'suspended') await ctx.resume();
               
               const audioBuffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
               const sourceNode = ctx.createBufferSource();
               sourceNode.buffer = audioBuffer;
               sourceNode.connect(ctx.destination);
               
-              sourceNode.onended = () => sourcesRef.current.delete(sourceNode);
+              // Schedule playback
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               sourceNode.start(nextStartTimeRef.current);
               nextStartTimeRef.current += audioBuffer.duration;
+              
+              sourceNode.onended = () => {
+                sourcesRef.current.delete(sourceNode);
+                if (sourcesRef.current.size === 0) setStatus('Lytter...');
+              };
               sourcesRef.current.add(sourceNode);
               setStatus('Taler...');
             }
 
             if (message.serverContent?.turnComplete) {
-              setStatus('Lytter...');
-              // Update History only if there's actual content
               if (transcript && translation) {
                 setHistory(prev => [{
                   timestamp: new Date(),
@@ -204,11 +213,10 @@ const App: React.FC = () => {
             }
 
             if (message.serverContent?.interrupted) {
-              sourcesRef.current.forEach(s => {
-                try { s.stop(); } catch(e) {}
-              });
+              sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
+              setStatus('Lytter...');
             }
           },
           onclose: () => stopSession(),
@@ -234,44 +242,43 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="flex flex-col h-screen max-h-screen bg-slate-950">
+    <div className="flex flex-col h-screen max-h-screen bg-slate-950 text-slate-100">
       {/* Top Bar */}
-      <header className="glass p-4 px-6 flex items-center justify-between z-10">
+      <header className="glass p-4 px-6 flex items-center justify-between z-10 shadow-lg">
         <div className="flex items-center gap-3">
-          <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors duration-300 ${isRecording ? 'bg-red-600 animate-pulse' : 'bg-blue-600'}`}>
-            <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-all duration-500 ${isRecording ? 'bg-red-600 scale-110 shadow-[0_0_20px_rgba(220,38,38,0.5)]' : 'bg-blue-600 shadow-lg'}`}>
+            <svg className={`w-6 h-6 text-white ${isRecording ? 'animate-pulse' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
             </svg>
           </div>
-          <div className="hidden sm:block">
-            <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-indigo-400 bg-clip-text text-transparent">
+          <div className="hidden xs:block">
+            <h1 className="text-lg sm:text-xl font-bold bg-gradient-to-r from-blue-400 to-indigo-400 bg-clip-text text-transparent">
               {uiStrings.title}
             </h1>
           </div>
         </div>
 
-        <div className="flex items-center gap-2 sm:gap-6">
-          <div className="flex flex-col gap-1">
-            <label className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">{uiStrings.sourceLang}</label>
+        <div className="flex items-center gap-2">
+          <div className="flex flex-col">
+            <label className="text-[8px] uppercase tracking-tighter text-slate-500 font-bold ml-1">Fra</label>
             <select 
               value={sourceLang}
               onChange={(e) => setSourceLang(e.target.value as Language | 'auto')}
-              className="bg-slate-900 border border-slate-800 text-xs sm:text-sm rounded-lg px-2 py-1 outline-none focus:ring-1 focus:ring-blue-500 transition-all text-slate-200"
+              className="bg-slate-900 border border-slate-800 text-[10px] sm:text-xs rounded-md px-2 py-1 outline-none text-slate-300"
               disabled={isRecording}
             >
-              <option value="auto">{uiStrings.auto}</option>
+              <option value="auto">Auto</option>
               {Object.entries(Language).map(([key, value]) => (
                 <option key={value} value={value}>{key}</option>
               ))}
             </select>
           </div>
-
-          <div className="flex flex-col gap-1">
-            <label className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">{uiStrings.targetLang}</label>
+          <div className="flex flex-col">
+            <label className="text-[8px] uppercase tracking-tighter text-slate-500 font-bold ml-1">Til</label>
             <select 
               value={targetLang}
               onChange={(e) => setTargetLang(e.target.value as Language)}
-              className="bg-slate-900 border border-slate-800 text-xs sm:text-sm rounded-lg px-2 py-1 outline-none focus:ring-1 focus:ring-blue-500 transition-all text-slate-200"
+              className="bg-slate-900 border border-slate-800 text-[10px] sm:text-xs rounded-md px-2 py-1 outline-none text-slate-300"
               disabled={isRecording}
             >
               {Object.entries(Language).map(([key, value]) => (
@@ -283,114 +290,95 @@ const App: React.FC = () => {
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col p-4 sm:p-6 gap-4 sm:gap-6 overflow-hidden">
+      <main className="flex-1 flex flex-col p-4 gap-4 overflow-hidden relative">
         
         {/* Visualizer & Status */}
-        <div className="glass rounded-3xl p-6 sm:p-8 flex flex-col justify-center items-center relative h-48 sm:h-64 border border-slate-800/50 shadow-2xl">
+        <div className="glass rounded-2xl p-4 sm:p-6 flex flex-col justify-center items-center relative h-32 sm:h-48 border border-slate-800/50">
           <WaveVisualizer isActive={isRecording} stream={stream} />
-          <div className="absolute top-4 right-6 flex items-center gap-2 px-3 py-1 bg-slate-950/50 rounded-full border border-slate-800">
-             <span className={`w-2 h-2 rounded-full ${status === 'Error' ? 'bg-red-500' : isRecording ? 'bg-green-500' : 'bg-slate-500'}`}></span>
-             <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tight">
-              {uiStrings.status}: {status}
+          <div className="absolute top-2 right-4 flex items-center gap-1.5 px-2 py-0.5 bg-black/40 rounded-full border border-slate-800">
+             <span className={`w-1.5 h-1.5 rounded-full ${status === 'Error' ? 'bg-red-500' : isRecording ? 'bg-green-500 animate-pulse' : 'bg-slate-500'}`}></span>
+             <span className="text-[9px] text-slate-400 font-black uppercase">
+              {status}
              </span>
           </div>
-          {isRecording && (
-            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] text-blue-400/60 font-medium animate-pulse">
-              Live Streaming Active
-            </div>
-          )}
         </div>
 
-        {/* Transcripts */}
-        <div className="flex-1 flex flex-col sm:flex-row gap-4 sm:gap-6 min-h-0">
-          <div className="flex-1 glass rounded-3xl p-5 sm:p-6 flex flex-col border border-slate-800/50 overflow-hidden">
-            <h3 className="text-xs font-bold text-blue-400/80 mb-3 flex items-center gap-2 uppercase tracking-widest">
-              <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
-              {uiStrings.heardText}
+        {/* Real-time Text Blocks */}
+        <div className="flex-1 flex flex-col gap-4 overflow-hidden">
+          <div className="flex-1 glass rounded-2xl p-4 border border-slate-800/50 flex flex-col min-h-0">
+            <h3 className="text-[10px] font-black text-blue-500 mb-2 uppercase tracking-[0.2em] flex items-center gap-2">
+              <span className="w-1 h-1 rounded-full bg-blue-500 shadow-[0_0_5px_blue]"></span>
+              Input
             </h3>
-            <div className="flex-1 overflow-y-auto text-base sm:text-xl leading-relaxed text-slate-300 scrollbar-hide">
-              {transcript || <span className="text-slate-600 italic text-sm">Venter på tale...</span>}
+            <div className="flex-1 overflow-y-auto text-base sm:text-lg text-slate-300 scroll-smooth scrollbar-hide">
+              {transcript || <span className="text-slate-700 italic text-sm">Venter på lyd...</span>}
             </div>
           </div>
 
-          <div className="flex-1 glass rounded-3xl p-5 sm:p-6 flex flex-col border border-slate-800/50 overflow-hidden">
-             <h3 className="text-xs font-bold text-indigo-400/80 mb-3 flex items-center gap-2 uppercase tracking-widest">
-              <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
-              {uiStrings.translatedText}
+          <div className="flex-1 glass rounded-2xl p-4 border border-indigo-900/30 flex flex-col min-h-0 bg-indigo-950/5">
+             <h3 className="text-[10px] font-black text-indigo-400 mb-2 uppercase tracking-[0.2em] flex items-center gap-2">
+              <span className="w-1 h-1 rounded-full bg-indigo-400 shadow-[0_0_5px_indigo]"></span>
+              Oversættelse
             </h3>
-            <div className="flex-1 overflow-y-auto text-base sm:text-xl leading-relaxed text-indigo-100 font-medium scrollbar-hide">
-              {translation || <span className="text-slate-600 italic text-sm">Oversættelse dukker op her...</span>}
+            <div className="flex-1 overflow-y-auto text-base sm:text-lg text-indigo-100 font-medium scroll-smooth scrollbar-hide">
+              {translation || <span className="text-slate-700 italic text-sm">Oversættelse vises her...</span>}
             </div>
           </div>
+        </div>
+
+        {/* Floating Controls */}
+        <div className="flex items-center justify-center gap-6 pb-6 pt-2">
+          <button 
+            onClick={() => setShowHistory(true)}
+            className="w-12 h-12 rounded-full flex items-center justify-center bg-slate-900/50 border border-slate-800 text-slate-400 active:scale-90 transition-transform"
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+          </button>
+
+          <button 
+            onClick={toggleRecording}
+            className={`w-20 h-20 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 active:scale-95 ${isRecording ? 'bg-red-600 hover:bg-red-700 scale-105' : 'bg-blue-600 hover:bg-blue-700 shadow-blue-500/20'} text-white border-4 border-slate-950`}
+          >
+            {isRecording ? (
+              <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+            ) : (
+              <svg className="w-10 h-10" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+            )}
+          </button>
+          
+          <button 
+            onClick={() => setGender(prev => prev === 'male' ? 'female' : 'male')}
+            className={`w-12 h-12 rounded-full flex items-center justify-center border transition-all active:scale-90 ${gender === 'male' ? 'bg-blue-900/20 border-blue-500/50 text-blue-400' : 'bg-pink-900/20 border-pink-500/50 text-pink-400'}`}
+          >
+             <span className="text-xl font-bold">{gender === 'male' ? '♂' : '♀'}</span>
+          </button>
         </div>
       </main>
 
-      {/* Floating Control Bar */}
-      <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-slate-900/80 backdrop-blur-xl p-3 rounded-full border border-slate-800 shadow-2xl z-20">
-        <button 
-          onClick={() => setShowHistory(true)}
-          className="w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center bg-slate-800/50 text-slate-400 hover:text-white transition-all hover:bg-slate-700"
-        >
-          <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-        </button>
-
-        <button 
-          onClick={toggleRecording}
-          className={`w-14 h-14 sm:w-16 sm:h-16 rounded-full flex items-center justify-center shadow-lg transition-all active:scale-90 ${isRecording ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-600 hover:bg-blue-700'} text-white`}
-        >
-          {isRecording ? (
-            <svg className="w-7 h-7 sm:w-8 sm:h-8" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
-          ) : (
-            <svg className="w-7 h-7 sm:w-8 sm:h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-          )}
-        </button>
-        
-        <button 
-          onClick={() => setGender(prev => prev === 'male' ? 'female' : 'male')}
-          className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center border transition-all ${gender === 'male' ? 'bg-blue-900/20 border-blue-500/50 text-blue-400' : 'bg-pink-900/20 border-pink-500/50 text-pink-400'}`}
-        >
-           {gender === 'male' ? <span className="text-lg font-bold">♂</span> : <span className="text-lg font-bold">♀</span>}
-        </button>
-      </div>
-
-      <footer className="p-3 bg-slate-950/80 text-center">
-        <div className="text-[9px] text-slate-600 uppercase tracking-[0.2em] font-black">
-          Gemini 2.5 Live Native Audio • Real-time Monitoring
-        </div>
-      </footer>
-
-      {/* History Modal */}
+      {/* History Drawer */}
       {showHistory && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex justify-end" onClick={() => setShowHistory(false)}>
-          <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full flex flex-col animate-slide-in shadow-[-20px_0_50px_rgba(0,0,0,0.5)]" onClick={e => e.stopPropagation()}>
-            <div className="p-6 border-b border-slate-800 flex items-center justify-between bg-slate-950/50">
-              <h2 className="text-xl font-bold flex items-center gap-2 text-slate-100">
-                <svg className="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                {uiStrings.history}
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-sm z-50 flex justify-end" onClick={() => setShowHistory(false)}>
+          <div className="w-full max-w-sm bg-slate-900 h-full flex flex-col animate-slide-in shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="p-6 border-b border-slate-800 flex items-center justify-between">
+              <h2 className="text-xl font-bold flex items-center gap-2">
+                Historik
               </h2>
-              <button onClick={() => setShowHistory(false)} className="text-slate-500 hover:text-white p-2 rounded-full hover:bg-slate-800 transition-colors">
+              <button onClick={() => setShowHistory(false)} className="text-slate-500 hover:text-white p-2">
                 <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-6 space-y-4 scrollbar-hide">
-              {history.length === 0 && (
-                <div className="h-full flex flex-col items-center justify-center text-slate-700 opacity-50">
-                  <p className="text-sm font-medium">Ingen historik endnu</p>
-                </div>
-              )}
+            <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-hide">
               {history.map((item, idx) => (
-                <div key={idx} className="bg-slate-800/40 rounded-2xl p-4 border border-slate-700/30 hover:border-slate-600/50 transition-colors group">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-[10px] text-slate-500 font-bold">{item.timestamp.toLocaleTimeString()}</span>
-                    <div className="flex gap-1.5">
-                       <span className="text-[9px] px-2 py-0.5 rounded-full bg-slate-900 text-slate-400 border border-slate-800">{item.sourceLang}</span>
-                       <span className="text-[9px] px-2 py-0.5 rounded-full bg-blue-900/40 text-blue-300 border border-blue-800/50">{item.targetLang}</span>
-                    </div>
+                <div key={idx} className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[9px] text-slate-500 font-black uppercase">{item.timestamp.toLocaleTimeString()}</span>
+                    <span className="text-[9px] px-2 py-0.5 rounded-md bg-blue-900/30 text-blue-300 border border-blue-800/50">{item.targetLang}</span>
                   </div>
-                  <p className="text-sm text-slate-400 mb-2 leading-relaxed italic group-hover:text-slate-300 transition-colors">"{item.originalText}"</p>
-                  <p className="text-sm text-indigo-100 font-semibold leading-relaxed group-hover:text-white transition-colors">{item.translatedText}</p>
+                  <p className="text-xs text-slate-400 mb-1 leading-relaxed">"{item.originalText}"</p>
+                  <p className="text-sm text-indigo-100 font-bold leading-relaxed">{item.translatedText}</p>
                 </div>
               ))}
+              {history.length === 0 && <p className="text-center text-slate-600 mt-10 text-sm">Ingen historik endnu</p>}
             </div>
           </div>
         </div>
@@ -398,9 +386,10 @@ const App: React.FC = () => {
 
       <style>{`
         @keyframes slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
-        .animate-slide-in { animation: slide-in 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+        .animate-slide-in { animation: slide-in 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
         .scrollbar-hide::-webkit-scrollbar { display: none; }
         .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        xs: { min-width: 400px; }
       `}</style>
     </div>
   );
